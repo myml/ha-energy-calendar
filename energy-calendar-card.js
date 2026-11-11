@@ -22,7 +22,7 @@
  */
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
-const CARD_VERSION = "0.2.1";
+const CARD_VERSION = "0.3.0";
 
 const MONTH_NAMES = [
   "1月", "2月", "3月", "4月", "5月", "6月",
@@ -646,115 +646,116 @@ class EnergyCalendarCard extends HTMLElement {
   }
 }
 
+/**
+ * Editor built on HA's own `ha-form`.
+ *
+ * `ha-form` with an `entity` selector renders Home Assistant's standard entity
+ * picker (search, icons, state preview, theme integration) and lazily loads the
+ * picker element itself, so this card does not have to depend on
+ * `ha-entity-picker` already being defined.
+ */
 class EnergyCalendarCardEditor extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._form = document.createElement("ha-form");
+    this._form.computeLabel = (schema) => schema.label || schema.name;
+    this._form.addEventListener("value-changed", (event) => {
+      event.stopPropagation();
+      this._emitValue(event.detail.value);
+    });
+    this.shadowRoot.appendChild(this._form);
+  }
+
   setConfig(config) {
     this._config = config || { entities: [] };
-    // Changing the config must not blow away a dropdown the user is interacting
-    // with; only structure changes force a rebuild.
-    this._render({ force: false });
+    if (this._form) {
+      this._form.schema = this._schema();
+      this._form.data = this._data();
+    }
   }
 
   set hass(hass) {
+    // Locally scoped `hass` keeps the entity picker live (states, icons).
     this._hass = hass;
-    if (!this._built) {
-      this._render({ force: true });
-      return;
-    }
-    // HA pushes a new `hass` on every state change (many times a minute). Only
-    // repaint when the set of selectable entities actually changed, otherwise
-    // an open <select> would be replaced and close itself.
-    if (this._candidateSignature() !== this._signature) {
-      this._render({ force: true });
-    }
+    if (this._form) this._form.hass = hass;
   }
 
-  /** A cheap fingerprint of the entity list shown in the dropdown. */
-  _candidateSignature() {
-    if (!this._hass) return "";
-    return this._candidates().join(",");
+  _firstEntity() {
+    const first = (this._config?.entities || [])[0];
+    return typeof first === "string" ? first : first?.entity || "";
   }
 
-  _candidates() {
-    const entities = (this._config.entities || []).map((e) =>
-      typeof e === "string" ? { entity: e } : e
-    );
-    const current = entities[0]?.entity;
-    if (!this._hass) return current ? [current] : [];
-    const list = Object.keys(this._hass.states).filter((id) => {
-      const a = this._hass.states[id].attributes;
-      return a.device_class === "energy" && a.state_class === "total_increasing";
-    });
-    // Keep the configured entity selectable even if it is temporarily missing.
-    if (current && !list.includes(current)) list.unshift(current);
-    return list.sort();
+  _schema() {
+    return [
+      {
+        name: "entity",
+        label: "电量实体",
+        required: true,
+        // Filter to cumulative energy sensors: exactly what this card can chart.
+        selector: {
+          entity: {
+            domain: "sensor",
+            device_class: "energy",
+          },
+        },
+      },
+      {
+        name: "price",
+        label: "电价（每 kWh，留空不显示电费）",
+        selector: { number: { min: 0, max: 100, step: 0.01, mode: "box", unit_of_measurement: "元/kWh" } },
+      },
+      {
+        name: "title",
+        label: "标题（留空为「2026年 11月」）",
+        selector: { text: {} },
+      },
+      {
+        name: "week_start",
+        label: "每周起始日",
+        selector: {
+          select: {
+            options: [
+              { value: "monday", label: "星期一" },
+              { value: "sunday", label: "星期日" },
+            ],
+          },
+        },
+      },
+      {
+        name: "tint",
+        label: "按用电量深浅着色",
+        selector: { boolean: {} },
+      },
+    ];
   }
 
-  _render({ force } = { force: false }) {
-    if (!this._config) return;
-    if (!this.shadowRoot) this.attachShadow({ mode: "open" });
+  _data() {
+    return {
+      entity: this._firstEntity(),
+      price: this._config?.price,
+      title: this._config?.title,
+      week_start: this._config?.week_start || "monday",
+      tint: this._config?.tint !== false,
+    };
+  }
 
-    const entities = (this._config.entities || []).map((e) =>
-      typeof e === "string" ? { entity: e } : e
-    );
-    const current = entities[0]?.entity;
-    const candidates = this._candidates();
-    this._signature = candidates.join(",");
+  _emitValue(value) {
+    const next = { ...this._config };
+    const first = (this._config.entities || [])[0];
+    const extras = typeof first === "object" ? { ...first } : {};
 
-    const existing = this.shadowRoot.querySelector("#entity");
-    if (!force && existing) {
-      // Same structure: patch values in place so focus and open state survive.
-      if (existing.value !== current) existing.value = current;
-      const priceInput = this.shadowRoot.querySelector("#price");
-      const price = this._config.price ?? "";
-      if (priceInput && document.activeElement !== priceInput &&
-          this.shadowRoot.activeElement !== priceInput &&
-          priceInput.value !== String(price)) {
-        priceInput.value = price;
-      }
-      return;
+    if (value.entity) {
+      next.entities = [{ ...extras, entity: value.entity }];
     }
+    for (const key of ["price", "title"]) {
+      if (value[key] === "" || value[key] === undefined) delete next[key];
+      else next[key] = value[key];
+    }
+    if (value.week_start) next.week_start = value.week_start;
+    if (value.tint !== undefined) next.tint = value.tint;
 
-    this.shadowRoot.innerHTML = `
-      <style>
-        .row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 14px; }
-        label { font-size: 13px; color: var(--secondary-text-color); }
-        select, input {
-          padding: 8px; border-radius: 6px; border: 1px solid var(--divider-color);
-          background: var(--card-background-color); color: var(--primary-text-color);
-          font: inherit;
-        }
-        .hint { font-size: 11px; color: var(--secondary-text-color); }
-      </style>
-      <div class="row">
-        <label>电量实体（累计型 energy）</label>
-        <select id="entity">
-          ${candidates
-            .map(
-              (id) =>
-                `<option value="${id}" ${id === current ? "selected" : ""}>${id}</option>`
-            )
-            .join("")}
-        </select>
-        <div class="hint">仅列出 device_class=energy 且 state_class=total_increasing 的实体</div>
-      </div>
-      <div class="row">
-        <label>电价（每 kWh，留空不显示电费）</label>
-        <input id="price" type="number" step="0.01" value="${this._config.price ?? ""}">
-      </div>
-    `;
-
-    this.shadowRoot.querySelector("#entity").addEventListener("change", (event) => {
-      this._emit({ ...this._config, entities: [{ entity: event.target.value }] });
-    });
-
-    this.shadowRoot.querySelector("#price").addEventListener("change", (event) => {
-      const next = { ...this._config };
-      if (event.target.value === "") delete next.price;
-      else next.price = Number(event.target.value);
-      this._emit(next);
-    });
-
-    this._built = true;
+    this._emit(next);
   }
 
   _emit(config) {
