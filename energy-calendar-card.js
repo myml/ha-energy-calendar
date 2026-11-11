@@ -22,7 +22,7 @@
  */
 
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
-const CARD_VERSION = "0.2.0";
+const CARD_VERSION = "0.2.1";
 
 const MONTH_NAMES = [
   "1月", "2月", "3月", "4月", "5月", "6月",
@@ -649,15 +649,47 @@ class EnergyCalendarCard extends HTMLElement {
 class EnergyCalendarCardEditor extends HTMLElement {
   setConfig(config) {
     this._config = config || { entities: [] };
-    this._render();
+    // Changing the config must not blow away a dropdown the user is interacting
+    // with; only structure changes force a rebuild.
+    this._render({ force: false });
   }
 
   set hass(hass) {
     this._hass = hass;
-    this._render();
+    if (!this._built) {
+      this._render({ force: true });
+      return;
+    }
+    // HA pushes a new `hass` on every state change (many times a minute). Only
+    // repaint when the set of selectable entities actually changed, otherwise
+    // an open <select> would be replaced and close itself.
+    if (this._candidateSignature() !== this._signature) {
+      this._render({ force: true });
+    }
   }
 
-  _render() {
+  /** A cheap fingerprint of the entity list shown in the dropdown. */
+  _candidateSignature() {
+    if (!this._hass) return "";
+    return this._candidates().join(",");
+  }
+
+  _candidates() {
+    const entities = (this._config.entities || []).map((e) =>
+      typeof e === "string" ? { entity: e } : e
+    );
+    const current = entities[0]?.entity;
+    if (!this._hass) return current ? [current] : [];
+    const list = Object.keys(this._hass.states).filter((id) => {
+      const a = this._hass.states[id].attributes;
+      return a.device_class === "energy" && a.state_class === "total_increasing";
+    });
+    // Keep the configured entity selectable even if it is temporarily missing.
+    if (current && !list.includes(current)) list.unshift(current);
+    return list.sort();
+  }
+
+  _render({ force } = { force: false }) {
     if (!this._config) return;
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
 
@@ -665,14 +697,22 @@ class EnergyCalendarCardEditor extends HTMLElement {
       typeof e === "string" ? { entity: e } : e
     );
     const current = entities[0]?.entity;
-    const candidates = this._hass
-      ? Object.keys(this._hass.states).filter((id) => {
-          const a = this._hass.states[id].attributes;
-          return a.device_class === "energy" && a.state_class === "total_increasing";
-        })
-      : current
-        ? [current]
-        : [];
+    const candidates = this._candidates();
+    this._signature = candidates.join(",");
+
+    const existing = this.shadowRoot.querySelector("#entity");
+    if (!force && existing) {
+      // Same structure: patch values in place so focus and open state survive.
+      if (existing.value !== current) existing.value = current;
+      const priceInput = this.shadowRoot.querySelector("#price");
+      const price = this._config.price ?? "";
+      if (priceInput && document.activeElement !== priceInput &&
+          this.shadowRoot.activeElement !== priceInput &&
+          priceInput.value !== String(price)) {
+        priceInput.value = price;
+      }
+      return;
+    }
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -681,6 +721,7 @@ class EnergyCalendarCardEditor extends HTMLElement {
         select, input {
           padding: 8px; border-radius: 6px; border: 1px solid var(--divider-color);
           background: var(--card-background-color); color: var(--primary-text-color);
+          font: inherit;
         }
         .hint { font-size: 11px; color: var(--secondary-text-color); }
       </style>
@@ -712,6 +753,8 @@ class EnergyCalendarCardEditor extends HTMLElement {
       else next.price = Number(event.target.value);
       this._emit(next);
     });
+
+    this._built = true;
   }
 
   _emit(config) {
